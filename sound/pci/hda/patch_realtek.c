@@ -2068,11 +2068,15 @@ static int alc_build_controls(struct hda_codec *codec)
  */
 
 static void alc_init_special_input_src(struct hda_codec *codec);
+static int alc269_fill_coef(struct hda_codec *codec);
 
 static int alc_init(struct hda_codec *codec)
 {
 	struct alc_spec *spec = codec->spec;
 	unsigned int i;
+
+	if (codec->vendor_id == 0x10ec0269)
+		alc269_fill_coef(codec);
 
 	alc_fix_pll(codec);
 	alc_auto_init_amp(codec, spec->init_amp);
@@ -2704,9 +2708,6 @@ static int alc_auto_fill_adc_caps(struct hda_codec *codec)
 	hda_nid_t *cap_nids = spec->private_capsrc_nids;
 	int max_nums = ARRAY_SIZE(spec->private_adc_nids);
 	int i, nums = 0;
-
-	if (spec->shared_mic_hp)
-		max_nums = 1; /* no multi streams with the shared HP/mic */
 
 	nid = codec->start_nid;
 	for (i = 0; i < codec->num_nodes; i++, nid++) {
@@ -3719,6 +3720,7 @@ static void alc_remove_invalid_adc_nids(struct hda_codec *codec)
 	if (spec->dyn_adc_switch)
 		return;
 
+ again:
 	nums = 0;
 	for (n = 0; n < spec->num_adc_nids; n++) {
 		hda_nid_t cap = spec->private_capsrc_nids[n];
@@ -3739,6 +3741,11 @@ static void alc_remove_invalid_adc_nids(struct hda_codec *codec)
 	if (!nums) {
 		/* check whether ADC-switch is possible */
 		if (!alc_check_dyn_adc_switch(codec)) {
+			if (spec->shared_mic_hp) {
+				spec->shared_mic_hp = 0;
+				spec->private_imux[0].num_items = 1;
+				goto again;
+			}
 			printk(KERN_WARNING "hda_codec: %s: no valid ADC found;"
 			       " using fallback 0x%x\n",
 			       codec->chip_name, spec->private_adc_nids[0]);
@@ -3756,7 +3763,7 @@ static void alc_remove_invalid_adc_nids(struct hda_codec *codec)
 
 	if (spec->auto_mic)
 		alc_auto_mic_check_imux(codec); /* check auto-mic setups */
-	else if (spec->input_mux->num_items == 1)
+	else if (spec->input_mux->num_items == 1 || spec->shared_mic_hp)
 		spec->num_adc_nids = 1; /* reduce to a single ADC */
 }
 
@@ -4367,6 +4374,7 @@ enum {
 	ALC882_FIXUP_PB_M5210,
 	ALC882_FIXUP_ACER_ASPIRE_7736,
 	ALC882_FIXUP_ASUS_W90V,
+	ALC889_FIXUP_CD,
 	ALC889_FIXUP_VAIO_TT,
 	ALC888_FIXUP_EEE1601,
 	ALC882_FIXUP_EAPD,
@@ -4491,6 +4499,13 @@ static const struct alc_fixup alc882_fixups[] = {
 		.type = ALC_FIXUP_PINS,
 		.v.pins = (const struct alc_pincfg[]) {
 			{ 0x16, 0x99130110 }, /* fix sequence for CLFE */
+			{ }
+		}
+	},
+	[ALC889_FIXUP_CD] = {
+		.type = ALC_FIXUP_PINS,
+		.v.pins = (const struct alc_pincfg[]) {
+			{ 0x1c, 0x993301f0 }, /* CD */
 			{ }
 		}
 	},
@@ -4634,6 +4649,7 @@ static const struct snd_pci_quirk alc882_fixup_tbl[] = {
 		      ALC882_FIXUP_ACER_ASPIRE_4930G),
 	SND_PCI_QUIRK(0x1025, 0x0155, "Packard-Bell M5120", ALC882_FIXUP_PB_M5210),
 	SND_PCI_QUIRK(0x1025, 0x0259, "Acer Aspire 5935", ALC889_FIXUP_DAC_ROUTE),
+	SND_PCI_QUIRK(0x1025, 0x026b, "Acer Aspire 8940G", ALC882_FIXUP_ACER_ASPIRE_8930G),
 	SND_PCI_QUIRK(0x1025, 0x0296, "Acer Aspire 7736z", ALC882_FIXUP_ACER_ASPIRE_7736),
 	SND_PCI_QUIRK(0x1043, 0x13c2, "Asus A7M", ALC882_FIXUP_EAPD),
 	SND_PCI_QUIRK(0x1043, 0x1873, "ASUS W90V", ALC882_FIXUP_ASUS_W90V),
@@ -4649,7 +4665,9 @@ static const struct snd_pci_quirk alc882_fixup_tbl[] = {
 	SND_PCI_QUIRK(0x106b, 0x3e00, "iMac 24 Aluminum", ALC885_FIXUP_MACPRO_GPIO),
 
 	SND_PCI_QUIRK(0x1071, 0x8258, "Evesham Voyaeger", ALC882_FIXUP_EAPD),
+	SND_PCI_QUIRK(0x1462, 0x7350, "MSI-7350", ALC889_FIXUP_CD),
 	SND_PCI_QUIRK_VENDOR(0x1462, "MSI", ALC882_FIXUP_GPIO3),
+	SND_PCI_QUIRK(0x1458, 0xa002, "Gigabyte EP45-DS3", ALC889_FIXUP_CD),
 	SND_PCI_QUIRK(0x147b, 0x107a, "Abit AW9D-MAX", ALC882_FIXUP_ABIT_AW9D_MAX),
 	SND_PCI_QUIRK_VENDOR(0x1558, "Clevo laptop", ALC882_FIXUP_EAPD),
 	SND_PCI_QUIRK(0x161f, 0x2054, "Medion laptop", ALC883_FIXUP_EAPD),
@@ -5385,6 +5403,7 @@ static const struct alc_fixup alc269_fixups[] = {
 };
 
 static const struct snd_pci_quirk alc269_fixup_tbl[] = {
+	SND_PCI_QUIRK(0x1043, 0x1427, "Asus Zenbook UX31E", ALC269VB_FIXUP_DMIC),
 	SND_PCI_QUIRK(0x1043, 0x1a13, "Asus G73Jw", ALC269_FIXUP_ASUS_G73JW),
 	SND_PCI_QUIRK(0x1043, 0x16e3, "ASUS UX50", ALC269_FIXUP_STEREO_DMIC),
 	SND_PCI_QUIRK(0x1043, 0x831a, "ASUS P901", ALC269_FIXUP_STEREO_DMIC),
@@ -5467,7 +5486,11 @@ static const struct alc_model_fixup alc269_fixup_models[] = {
 
 static int alc269_fill_coef(struct hda_codec *codec)
 {
+	struct alc_spec *spec = codec->spec;
 	int val;
+
+	if (spec->codec_variant != ALC269_TYPE_ALC269VB)
+		return 0;
 
 	if ((alc_get_coef0(codec) & 0x00ff) < 0x015) {
 		alc_write_coef_idx(codec, 0xf, 0x960b);

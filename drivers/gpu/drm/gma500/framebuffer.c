@@ -158,7 +158,7 @@ static int psbfb_vm_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 	unsigned long phys_addr = (unsigned long)dev_priv->stolen_base;
 
 	page_num = (vma->vm_end - vma->vm_start) >> PAGE_SHIFT;
-	address = (unsigned long)vmf->virtual_address;
+	address = (unsigned long)vmf->virtual_address - (vmf->pgoff << PAGE_SHIFT);
 
 	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
 
@@ -247,7 +247,6 @@ static struct fb_ops psbfb_roll_ops = {
 	.fb_imageblit = cfb_imageblit,
 	.fb_pan_display = psbfb_pan,
 	.fb_mmap = psbfb_mmap,
-	.fb_sync = psbfb_sync,
 	.fb_ioctl = psbfb_ioctl,
 };
 

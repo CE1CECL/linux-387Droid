@@ -67,6 +67,7 @@ static int max_queued_requests = 1024;
 
 static void allow_barrier(struct r10conf *conf);
 static void lower_barrier(struct r10conf *conf);
+static int enough(struct r10conf *conf, int ignore);
 
 static void * r10bio_pool_alloc(gfp_t gfp_flags, void *data)
 {
@@ -347,6 +348,19 @@ static void raid10_end_read_request(struct bio *bio, int error)
 		 * wait for the 'master' bio.
 		 */
 		set_bit(R10BIO_Uptodate, &r10_bio->state);
+	} else {
+		/* If all other devices that store this block have
+		 * failed, we want to return the error upwards rather
+		 * than fail the last device.  Here we redefine
+		 * "uptodate" to mean "Don't want to retry"
+		 */
+		unsigned long flags;
+		spin_lock_irqsave(&conf->device_lock, flags);
+		if (!enough(conf, rdev->raid_disk))
+			uptodate = 1;
+		spin_unlock_irqrestore(&conf->device_lock, flags);
+	}
+	if (uptodate) {
 		raid_end_bio_io(r10_bio);
 		rdev_dec_pending(rdev, conf->mddev);
 	} else {
@@ -849,9 +863,22 @@ static void wait_barrier(struct r10conf *conf)
 	spin_lock_irq(&conf->resync_lock);
 	if (conf->barrier) {
 		conf->nr_waiting++;
-		wait_event_lock_irq(conf->wait_barrier, !conf->barrier,
+		/* Wait for the barrier to drop.
+		 * However if there are already pending
+		 * requests (preventing the barrier from
+		 * rising completely), and the
+		 * pre-process bio queue isn't empty,
+		 * then don't wait, as we need to empty
+		 * that queue to get the nr_pending
+		 * count down.
+		 */
+		wait_event_lock_irq(conf->wait_barrier,
+				    !conf->barrier ||
+				    (conf->nr_pending &&
+				     current->bio_list &&
+				     !bio_list_empty(current->bio_list)),
 				    conf->resync_lock,
-				    );
+			);
 		conf->nr_waiting--;
 	}
 	conf->nr_pending++;
@@ -1715,6 +1742,7 @@ static void sync_request_write(struct mddev *mddev, struct r10bio *r10_bio)
 	struct r10conf *conf = mddev->private;
 	int i, first;
 	struct bio *tbio, *fbio;
+	int vcnt;
 
 	atomic_set(&r10_bio->remaining, 1);
 
@@ -1729,10 +1757,10 @@ static void sync_request_write(struct mddev *mddev, struct r10bio *r10_bio)
 	first = i;
 	fbio = r10_bio->devs[i].bio;
 
+	vcnt = (r10_bio->sectors + (PAGE_SIZE >> 9) - 1) >> (PAGE_SHIFT - 9);
 	/* now find blocks with errors */
 	for (i=0 ; i < conf->copies ; i++) {
 		int  j, d;
-		int vcnt = r10_bio->sectors >> (PAGE_SHIFT-9);
 
 		tbio = r10_bio->devs[i].bio;
 
@@ -1798,7 +1826,6 @@ static void sync_request_write(struct mddev *mddev, struct r10bio *r10_bio)
 	 */
 	for (i = 0; i < conf->copies; i++) {
 		int j, d;
-		int vcnt = r10_bio->sectors >> (PAGE_SHIFT-9);
 
 		tbio = r10_bio->devs[i].repl_bio;
 		if (!tbio || !tbio->bi_end_io)
@@ -2052,6 +2079,7 @@ static void fix_read_error(struct r10conf *conf, struct mddev *mddev, struct r10
 		       "md/raid10:%s: %s: Failing raid device\n",
 		       mdname(mddev), b);
 		md_error(mddev, conf->mirrors[d].rdev);
+		r10_bio->devs[r10_bio->read_slot].bio = IO_BLOCKED;
 		return;
 	}
 
@@ -2105,8 +2133,11 @@ static void fix_read_error(struct r10conf *conf, struct mddev *mddev, struct r10
 				    rdev,
 				    r10_bio->devs[r10_bio->read_slot].addr
 				    + sect,
-				    s, 0))
+				    s, 0)) {
 				md_error(mddev, rdev);
+				r10_bio->devs[r10_bio->read_slot].bio
+					= IO_BLOCKED;
+			}
 			break;
 		}
 
@@ -2299,17 +2330,20 @@ static void handle_read_error(struct mddev *mddev, struct r10bio *r10_bio)
 	 * This is all done synchronously while the array is
 	 * frozen.
 	 */
+	bio = r10_bio->devs[slot].bio;
+	bdevname(bio->bi_bdev, b);
+	bio_put(bio);
+	r10_bio->devs[slot].bio = NULL;
+
 	if (mddev->ro == 0) {
 		freeze_array(conf);
 		fix_read_error(conf, mddev, r10_bio);
 		unfreeze_array(conf);
-	}
+	} else
+		r10_bio->devs[slot].bio = IO_BLOCKED;
+
 	rdev_dec_pending(rdev, mddev);
 
-	bio = r10_bio->devs[slot].bio;
-	bdevname(bio->bi_bdev, b);
-	r10_bio->devs[slot].bio =
-		mddev->ro ? IO_BLOCKED : NULL;
 read_more:
 	rdev = read_balance(conf, r10_bio, &max_sectors);
 	if (rdev == NULL) {
@@ -2318,13 +2352,10 @@ read_more:
 		       mdname(mddev), b,
 		       (unsigned long long)r10_bio->sector);
 		raid_end_bio_io(r10_bio);
-		bio_put(bio);
 		return;
 	}
 
 	do_sync = (r10_bio->master_bio->bi_rw & REQ_SYNC);
-	if (bio)
-		bio_put(bio);
 	slot = r10_bio->read_slot;
 	printk_ratelimited(
 		KERN_ERR
@@ -2360,7 +2391,6 @@ read_more:
 			mbio->bi_phys_segments++;
 		spin_unlock_irq(&conf->device_lock);
 		generic_make_request(bio);
-		bio = NULL;
 
 		r10_bio = mempool_alloc(conf->r10bio_pool,
 					GFP_NOIO);
@@ -3243,7 +3273,6 @@ static int run(struct mddev *mddev)
 			disk->rdev = rdev;
 		}
 
-		disk->rdev = rdev;
 		disk_stack_limits(mddev->gendisk, rdev->bdev,
 				  rdev->data_offset << 9);
 		/* as we don't honour merge_bvec_fn, we must never risk
